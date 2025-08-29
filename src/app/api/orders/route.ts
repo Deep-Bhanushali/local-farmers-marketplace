@@ -7,10 +7,11 @@ import Notification from "@/models/Notification";
 import "@/models/User"; // Ensures User model is registered before population
 import { getUserFromRequest } from "@/lib/auth";
 import { createPaymentIntent } from "@/lib/stripe";
-import { FilterQuery } from "mongoose";
+import { FilterQuery, startSession } from "mongoose"; // Import startSession for transactions
 import Stripe from "stripe";
 
 // --- GET /api/orders ---
+// Fetches orders for a customer or sales for a farmer.
 export async function GET(req: NextRequest) {
   try {
     await dbConnect();
@@ -68,10 +69,12 @@ export async function GET(req: NextRequest) {
 }
 
 // --- POST /api/orders ---
-// Creates a new order, notifications, payment intent, and real-time event.
+// Creates a new order and decreases product stock within a database transaction.
 export async function POST(req: NextRequest) {
+  const session = await startSession();
+  session.startTransaction();
+
   try {
-    // 1. Get the globally available Socket.IO server instance
     const io = global.io as Server;
     if (!io) {
       console.warn(
@@ -83,6 +86,8 @@ export async function POST(req: NextRequest) {
 
     const user = getUserFromRequest(req);
     if (!user) {
+      await session.abortTransaction();
+      session.endSession();
       return NextResponse.json(
         { error: "Authentication required" },
         { status: 401 }
@@ -92,35 +97,38 @@ export async function POST(req: NextRequest) {
     const { items, shippingAddress, paymentMethod, notes } = await req.json();
 
     if (!items || !Array.isArray(items) || items.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
       return NextResponse.json(
         { error: "Order must contain at least one item" },
         { status: 400 }
       );
     }
     if (!shippingAddress) {
+      await session.abortTransaction();
+      session.endSession();
       return NextResponse.json(
         { error: "Shipping address is required" },
         { status: 400 }
       );
     }
 
-    // 2. Validate products and calculate total
     const orderItems = [];
     let totalAmount = 0;
+
+    // Process each item within the transaction
     for (const item of items) {
-      const product = await Product.findById(item.product);
+      const product = await Product.findById(item.product).session(session);
       if (!product) {
-        return NextResponse.json(
-          { error: `Product ${item.product} not found` },
-          { status: 404 }
-        );
+        throw new Error(`Product ${item.product} not found`);
       }
       if (product.quantity < item.quantity) {
-        return NextResponse.json(
-          { error: `Insufficient stock for ${product.name}` },
-          { status: 400 }
-        );
+        throw new Error(`Insufficient stock for ${product.name}`);
       }
+
+      product.quantity -= item.quantity;
+      await product.save({ session });
+
       totalAmount += product.price * item.quantity;
       orderItems.push({
         product: product._id,
@@ -129,7 +137,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 3. Create and save the order
     const order = new Order({
       customer: user.userId,
       items: orderItems,
@@ -138,14 +145,8 @@ export async function POST(req: NextRequest) {
       paymentMethod,
       notes,
     });
-    const savedOrder = await order.save();
+    const savedOrder = await order.save({ session });
 
-    // For the farmer(s):
-    const productIds = orderItems.map((item) => item.product);
-    const productsInOrder = await Product.find({ _id: { $in: productIds } });
-    const farmerIds = new Set(productsInOrder.map((p) => p.farmer.toString()));
-
-    // 6. Handle payment processing (e.g., Stripe)
     let paymentIntent: Stripe.PaymentIntent | null = null;
     if (paymentMethod === "stripe") {
       paymentIntent = await createPaymentIntent(
@@ -153,29 +154,36 @@ export async function POST(req: NextRequest) {
         savedOrder._id.toString()
       );
       order.stripePaymentIntentId = paymentIntent.id;
-      await order.save();
+      await order.save({ session });
     }
 
-    // 7. Populate details for the final response
+    await session.commitTransaction();
+    session.endSession();
+
     await savedOrder.populate("customer", "name email");
     await savedOrder.populate("items.product", "name price images");
 
+    const productIds = orderItems.map((item) => item.product);
+    const productsInOrder = await Product.find({ _id: { $in: productIds } });
+
+    // --- THIS IS THE CORRECTED LINE ---
+    const farmerIds = new Set(productsInOrder.map((p) => p.farmer.toString()));
+    // ------------------------------------
+
     for (const farmerId of farmerIds) {
-      // Create the database notification
       await Notification.create({
         user: farmerId,
         message: `You have a new order (#${savedOrder._id
           .toString()
           .slice(-6)}) containing your products.`,
-        link: `/${savedOrder._id}`,
+        link: `/orders/${savedOrder._id}`,
       });
 
-      // 5. Emit the real-time event ONLY to the specific farmer
       if (io) {
         const farmerOrderData = {
           _id: savedOrder._id,
           createdAt: savedOrder.createdAt,
-          customerName: "A New Customer", // For privacy, or populate if needed
+          customerName: "A New Customer",
           totalAmount: savedOrder.totalAmount,
         };
         io.to(farmerId).emit("new_order", farmerOrderData);
@@ -188,7 +196,7 @@ export async function POST(req: NextRequest) {
       message: `Your order #${savedOrder._id
         .toString()
         .slice(-6)} has been placed successfully!`,
-      link: `/${savedOrder._id}`,
+      link: `/orders/${savedOrder._id}`,
     });
 
     return NextResponse.json({
@@ -199,7 +207,20 @@ export async function POST(req: NextRequest) {
       message: "Order created successfully",
     });
   } catch (error: unknown) {
+    await session.abortTransaction();
+    session.endSession();
+
     console.error("Create order error:", error);
+    const message =
+      error instanceof Error ? error.message : "Internal server error";
+
+    if (
+      message.includes("Insufficient stock") ||
+      message.includes("not found")
+    ) {
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
+
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }
