@@ -184,7 +184,7 @@ export async function PUT(
         message: `Update: Your order #${order._id
           .toString()
           .slice(-6)} has been marked as '${status}'.`,
-        link: `/orders/${order._id}`,
+        link: `/${order._id}`,
       });
 
       if (io) {
@@ -215,3 +215,4 @@ export async function PUT(
     );
   }
 }
+
